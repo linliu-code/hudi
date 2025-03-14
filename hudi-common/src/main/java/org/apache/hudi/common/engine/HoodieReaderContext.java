@@ -240,12 +240,12 @@ public abstract class HoodieReaderContext<T> implements Closeable {
                                      Map<String, Object> metadataMap,
                                      Schema schema,
                                      Option<String> orderingFieldName) {
-    if (metadataMap.containsKey(INTERNAL_META_ORDERING_FIELD)) {
-      return (Comparable) metadataMap.get(INTERNAL_META_ORDERING_FIELD);
-    }
-
     if (!recordOption.isPresent() || orderingFieldName.isEmpty()) {
       return DEFAULT_ORDERING_VALUE;
+    }
+
+    if (metadataMap.containsKey(INTERNAL_META_ORDERING_FIELD)) {
+      return (Comparable) metadataMap.get(INTERNAL_META_ORDERING_FIELD);
     }
 
     Object value = getValue(recordOption.get(), schema, orderingFieldName.get());
