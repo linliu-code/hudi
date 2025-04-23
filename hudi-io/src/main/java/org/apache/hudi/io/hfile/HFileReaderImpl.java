@@ -81,8 +81,7 @@ public class HFileReaderImpl implements HFileReader {
     if (trailer.getNumDataIndexLevels() == 1) {
       this.dataBlockIndexEntryMap = dataIndexBlock.readBlockIndex(trailer.getDataIndexCount(), false);
     } else {
-      this.dataBlockIndexEntryMap = readBlockIndexForMultiLevelIndex(
-          trailer.getDataIndexCount(), false, trailer.getNumDataIndexLevels());
+      this.dataBlockIndexEntryMap = readBlockIndexForMultiLevelIndex(trailer.getDataIndexCount(), false);
     }
     HFileRootIndexBlock metaIndexBlock =
         (HFileRootIndexBlock) blockReader.nextBlock(HFileBlockType.ROOT_INDEX);
@@ -308,53 +307,78 @@ public class HFileReaderImpl implements HFileReader {
     return false;
   }
 
+  int getIndexingLevels() {
+    return trailer.getNumDataIndexLevels();
+  }
+
   /**
    * Read multiple-level indexes, and load all data block information into memory in BFS fashion.
+   * Indexing tree looks as follows:
+   *   level k:   root_index block
+   *   level k-1: intermediate_index block1, intermediate_index block2, ...
+   *   level k-2: ...
+   *   ...
+   *   level 1:   leaf_index block1, leaf_index block2, ...
+   *   level 0:   data block1, data block2, ...
+   *
+   * We use BFS style to parse index blocks level by level from k to 1.
+   * After parsing all leaf_index blocks, the index entries are for data blocks.
+   * Then we build and return the (key -> index entry) map.
    *
    * @param numEntries      The number of entries in the root index block.
    * @param contentKeyOnly  Only need the key content.
-   * @param levels          The level of the indexes.
-   * @return
+   * @return                The map between block key and block index entry.
    */
   public TreeMap<Key, BlockIndexEntry> readBlockIndexForMultiLevelIndex(int numEntries,
-                                                                        boolean contentKeyOnly,
-                                                                        int levels) throws IOException {
+                                                                        boolean contentKeyOnly) throws IOException {
     // Stores next patch of leaf index entries in order.
     List<BlockIndexEntry> indexEntries;
+    int indexlevel = trailer.getNumDataIndexLevels();
 
-    // Parse root index block.
+    // 1. Parse root index block.
+    indexEntries = parseRootIndexBlock(numEntries, contentKeyOnly);
+    indexlevel--;
+
+    // 2. Parse intermediate and leaf index block by BFS.
+    Queue<BlockIndexEntry> queue = new LinkedList<>();
+    while (indexlevel >= 1) {
+      // 2.1. Put intermediate / leaf index entries to the queue.
+      queue.addAll(indexEntries);
+      // 2.2. Prepare for next batch.
+      indexEntries.clear();
+      // 2.3. Process each non-root index block from the queue.
+      while (!queue.isEmpty()) {
+        BlockIndexEntry indexEntry = queue.poll();
+        indexEntries.addAll(parseNonRootIndexBlock(indexEntry, indexlevel, contentKeyOnly));
+      }
+      // 2.4. Lower index level.
+      indexlevel--;
+    }
+
+    // 3. Now all entries are for data blocks, and return the map.
+    return buildIndexEntryMap(indexEntries);
+  }
+
+  private List<BlockIndexEntry> parseRootIndexBlock(int numEntries,
+                                                    boolean contentKeyOnly) throws IOException {
     HFileBlockReader blockReader = new HFileBlockReader(
         context, stream, trailer.getLoadOnOpenDataOffset(), fileSize - HFileTrailer.getTrailerSize());
     HFileBlock block = blockReader.nextBlock(HFileBlockType.ROOT_INDEX);
-    indexEntries = ((HFileRootIndexBlock) block).readBlockIndexForMultiLevelIndex(numEntries, contentKeyOnly);
-    levels--;
+    return ((HFileRootIndexBlock) block).readBlockIndexForMultiLevelIndex(numEntries, contentKeyOnly);
+  }
 
-    // Supports BFS search for leaf index entries.
-    Queue<BlockIndexEntry> queue = new LinkedList<>();
-    while (levels >= 1) {
-      // (2) Put intermediate / leaf index entries to the queue.
-      for (int i = 0; i < indexEntries.size(); i++) {
-        queue.add(indexEntries.get(i));
-      }
-      indexEntries.clear();
+  private List<BlockIndexEntry> parseNonRootIndexBlock(BlockIndexEntry indexEntry,
+                                                       int indexLevel,
+                                                       boolean contentKeyOnly) throws IOException {
+    HFileBlockReader blockReader = new HFileBlockReader(
+        context, stream, indexEntry.getOffset(), indexEntry.getOffset() + indexEntry.getSize());
+    HFileBlockType blockType = indexLevel > 1
+        ? HFileBlockType.INTERMEDIATE_INDEX : HFileBlockType.LEAF_INDEX;
+    HFileBlock tempBlock = blockReader.nextBlock(blockType);
+    return ((HFileLeafIndexBlock) tempBlock).readBlockIndex(contentKeyOnly);
+  }
 
-      // (3) BFS.
-      while (!queue.isEmpty()) {
-        BlockIndexEntry indexEntry = queue.poll();
-        blockReader = new HFileBlockReader(
-            context, stream, indexEntry.getOffset(), indexEntry.getOffset() + indexEntry.getSize());
-        HFileBlockType blockType = levels > 1
-            ? HFileBlockType.INTERMEDIATE_INDEX : HFileBlockType.LEAF_INDEX;
-        HFileBlock tempBlock = blockReader.nextBlock(blockType);
-        indexEntries.addAll(
-            ((HFileLeafIndexBlock) tempBlock).readBlockIndex(contentKeyOnly));
-      }
-
-      // (4) Lower index level.
-      levels--;
-    }
-
-    // (5) Now all entries are data blocks. Put them into the map.
+  private TreeMap<Key, BlockIndexEntry> buildIndexEntryMap(List<BlockIndexEntry> indexEntries) {
     TreeMap<Key, BlockIndexEntry> blockIndexEntryMap = new TreeMap<>();
     for (int i = 0; i < indexEntries.size(); i++) {
       Key key = indexEntries.get(i).getFirstKey();
@@ -368,8 +392,6 @@ public class HFileReaderImpl implements HFileReader {
               indexEntries.get(i).getOffset(),
               indexEntries.get(i).getSize()));
     }
-
-    // (6) Returns the combined index entry map.
     return blockIndexEntryMap;
   }
 }
