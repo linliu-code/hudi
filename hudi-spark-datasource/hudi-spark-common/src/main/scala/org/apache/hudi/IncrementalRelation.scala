@@ -19,6 +19,7 @@ package org.apache.hudi
 
 import org.apache.avro.Schema
 import org.apache.hadoop.fs.{GlobPattern, Path}
+import org.apache.hudi.avro.AvroSchemaUtils
 import org.apache.hudi.DataSourceReadOptions.INCREMENTAL_READ_SCHEMA_USE_END_INSTANTTIME
 import org.apache.hudi.HoodieBaseRelation.isSchemaEvolutionEnabledOnRead
 import org.apache.hudi.HoodieSparkConfUtils.getHollowCommitHandling
@@ -35,6 +36,7 @@ import org.apache.hudi.config.HoodieWriteConfig
 import org.apache.hudi.exception.{HoodieException, HoodieIncrementalPathNotFoundException}
 import org.apache.hudi.internal.schema.InternalSchema
 import org.apache.hudi.internal.schema.utils.SerDeHelper
+import org.apache.hudi.io.storage.HoodieFileReader
 import org.apache.hudi.table.HoodieSparkTable
 import org.apache.spark.api.java.JavaSparkContext
 import org.apache.spark.rdd.RDD
@@ -203,10 +205,13 @@ class IncrementalRelation(val sqlContext: SQLContext,
       sqlContext.sparkContext.hadoopConfiguration.set(SparkInternalSchemaConverter.HOODIE_QUERY_SCHEMA, SerDeHelper.toJson(internalSchema))
       sqlContext.sparkContext.hadoopConfiguration.set(SparkInternalSchemaConverter.HOODIE_TABLE_PATH, metaClient.getBasePath)
       sqlContext.sparkContext.hadoopConfiguration.set(SparkInternalSchemaConverter.HOODIE_VALID_COMMITS_LIST, validCommits)
-      // Pass table Avro schema to LegacyHoodieParquetFileFormat to preserve correct logical types
+      // Pass table Avro schema to hadoopConf so supportBatch() can find it (supportBatch does not receive options).
       if (tableAvroSchema.getType != Schema.Type.NULL) {
         LegacyHoodieParquetFileFormat.setTableAvroSchemaInConf(
           sqlContext.sparkContext.hadoopConfiguration, tableAvroSchema)
+        sqlContext.sparkContext.hadoopConfiguration.set(
+          HoodieFileReader.ENABLE_LOGICAL_TIMESTAMP_REPAIR,
+          AvroSchemaUtils.hasTimestampMillisField(tableAvroSchema).toString)
       }
       val formatClassName = metaClient.getTableConfig.getBaseFileFormat match {
         case HoodieFileFormat.PARQUET => LegacyHoodieParquetFileFormat.FILE_FORMAT_ID
@@ -273,7 +278,12 @@ class IncrementalRelation(val sqlContext: SQLContext,
 
             if (regularFileIdToFullPath.nonEmpty) {
               try {
-                df = df.union(sqlContext.read.options(sOpts)
+                val optionsWithSchema = if (tableAvroSchema.getType != Schema.Type.NULL) {
+                  sOpts + (LegacyHoodieParquetFileFormat.HOODIE_TABLE_AVRO_SCHEMA -> tableAvroSchema.toString)
+                } else {
+                  sOpts
+                }
+                df = df.union(sqlContext.read.options(optionsWithSchema)
                   .schema(usedSchema).format(formatClassName)
                   // Setting time to the END_INSTANT_TIME, to avoid pathFilter filter out files incorrectly.
                   .option(DataSourceReadOptions.TIME_TRAVEL_AS_OF_INSTANT.key(), endInstantTime)

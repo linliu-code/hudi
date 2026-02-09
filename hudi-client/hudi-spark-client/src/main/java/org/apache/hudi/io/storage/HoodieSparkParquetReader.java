@@ -64,7 +64,6 @@ public class HoodieSparkParquetReader implements HoodieSparkFileReader {
   private final Configuration conf;
   private final BaseFileUtils parquetUtils;
   private List<ParquetReaderIterator> readerIterators = new ArrayList<>();
-  public static final String ENABLE_LOGICAL_TIMESTAMP_REPAIR = "spark.hudi.logicalTimestampField.repair.enable";
   private Option<MessageType> fileSchemaOption = Option.empty();
   private Option<StructType> structTypeOption = Option.empty();
   private Option<Schema> schemaOption = Option.empty();
@@ -73,7 +72,7 @@ public class HoodieSparkParquetReader implements HoodieSparkFileReader {
     this.path = path;
     this.conf = new Configuration(conf);
     // Avoid adding record in list element when convert parquet schema to avro schema
-    conf.set(ADD_LIST_ELEMENT_RECORDS, "false");
+    this.conf.set(ADD_LIST_ELEMENT_RECORDS, "false");
     this.parquetUtils = BaseFileUtils.getInstance(HoodieFileFormat.PARQUET);
   }
 
@@ -126,6 +125,10 @@ public class HoodieSparkParquetReader implements HoodieSparkFileReader {
     if (requestedSchema == null) {
       requestedSchema = readerSchema;
     }
+    // Set configuration for timestamp_millis type repair (only when not already set).
+    if (conf.get(HoodieFileReader.ENABLE_LOGICAL_TIMESTAMP_REPAIR) == null) {
+      conf.set(ENABLE_LOGICAL_TIMESTAMP_REPAIR, Boolean.toString(AvroSchemaUtils.hasTimestampMillisField(readerSchema)));
+    }
     MessageType fileSchema = getFileSchema();
     Schema nonNullSchema = AvroSchemaUtils.getNonNullTypeFromUnion(requestedSchema);
     Option<MessageType> messageSchema = Option.of(getAvroSchemaConverter(conf).convert(nonNullSchema));
@@ -136,8 +139,9 @@ public class HoodieSparkParquetReader implements HoodieSparkFileReader {
     conf.set(SQLConf.PARQUET_BINARY_AS_STRING().key(), SQLConf.get().getConf(SQLConf.PARQUET_BINARY_AS_STRING()).toString());
     conf.set(SQLConf.PARQUET_INT96_AS_TIMESTAMP().key(), SQLConf.get().getConf(SQLConf.PARQUET_INT96_AS_TIMESTAMP()).toString());
     ParquetReader<InternalRow> reader = ParquetReader.<InternalRow>builder(
-        (ReadSupport) SparkAdapterSupport$.MODULE$.sparkAdapter().getParquetReadSupport(messageSchema),
-            new Path(path.toUri())).withConf(conf)
+        (ReadSupport) SparkAdapterSupport$.MODULE$.sparkAdapter().getParquetReadSupport(conf, messageSchema),
+            path)
+        .withConf(conf)
         .build();
     ParquetReaderIterator<InternalRow> parquetReaderIterator = new ParquetReaderIterator<>(reader);
     readerIterators.add(parquetReaderIterator);
